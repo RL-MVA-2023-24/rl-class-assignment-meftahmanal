@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
-from src.env_hiv import HIVPatient  # Assuming env_hiv.py contains the environment
+from env_hiv import HIVPatient  
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
