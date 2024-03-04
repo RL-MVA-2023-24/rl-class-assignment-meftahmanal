@@ -7,7 +7,6 @@ import numpy as np
 import random
 import os
 
-# Wrap the HIV environment to limit the number of steps per episode
 env = TimeLimit(env=HIVPatient(domain_randomization=False), max_episode_steps=200)
 
 class ReplayBuffer:
@@ -24,15 +23,16 @@ class ReplayBuffer:
         self.index = (self.index + 1) % self.capacity
 
     def sample(self, batch_size):
-        batch = random.sample(self.data, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return (
-            torch.stack(states).to(self.device),
-            torch.tensor(actions, device=self.device, dtype=torch.long),
-            torch.tensor(rewards, device=self.device, dtype=torch.float),
-            torch.stack(next_states).to(self.device),
-            torch.tensor(dones, device=self.device, dtype=torch.float)
-        )
+        experiences = random.sample(self.data, batch_size)
+        
+        states = torch.tensor([e[0] for e in experiences], dtype=torch.float, device=self.device)
+        actions = torch.tensor([e[1] for e in experiences], dtype=torch.long, device=self.device)
+        rewards = torch.tensor([e[2] for e in experiences], dtype=torch.float, device=self.device)
+        next_states = torch.tensor([e[3] for e in experiences], dtype=torch.float, device=self.device)
+        dones = torch.tensor([e[4] for e in experiences], dtype=torch.float, device=self.device)
+        
+        return states, actions, rewards, next_states, dones
+
     def __len__(self):
         return len(self.data)
 
