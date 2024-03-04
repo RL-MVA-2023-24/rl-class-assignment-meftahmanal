@@ -125,6 +125,5 @@ if __name__ == "__main__":
     agent = ProjectAgent(state_size=state_size, action_size=action_size)
     scores = train_agent(agent, env)
 
-    # Optionally, you can save the final model and scores or plot the scores for analysis.
     agent.save('final_model.pth')
 
