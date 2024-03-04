@@ -1,66 +1,105 @@
 import numpy as np
-from collections import defaultdict
-
-# Import the environment and necessary wrappers
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
 from gymnasium.wrappers import TimeLimit
 from env_hiv import HIVPatient
+from interface import Agent
 
-# Set up the environment with domain randomization disabled
-env = TimeLimit(
-    env=HIVPatient(domain_randomization=False), max_episode_steps=200
-)
+class DQN(nn.Module):
+    def __init__(self):
+        super(DQN, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(6, 256),  # Assuming 6 observation variables
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4)   # Assuming 4 actions
+        )
+    
+    def forward(self, x):
+        return self.fc(x)
 
-class ProjectAgent:
-    def __init__(self, n_actions=4, n_states=6, alpha=0.1, gamma=0.9, epsilon=0.1):
-        self.n_actions = n_actions
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.q_table = defaultdict(lambda: np.zeros(n_actions))
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+    
+    def __len__(self):
+        return len(self.buffer)
 
+class DDQNAgent(Agent):
+    def __init__(self):
+        self.policy_net = DQN()
+        self.target_net = DQN()
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()  # Target net is not trained
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
+        self.memory = ReplayBuffer(10000)
+        self.batch_size = 64
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.gamma = 0.99  # Discount factor
+    
     def act(self, state, use_random=False):
-        if np.random.uniform(0, 1) < self.epsilon or use_random:
-            return np.random.randint(self.n_actions)
-        else:
-            return np.argmax(self.q_table[state])
+        if use_random or np.random.rand() <= self.epsilon:
+            return np.random.choice(4)
+        state = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            action_values = self.policy_net(state)
+        return action_values.max(1)[1].item()
+    
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        transitions = self.memory.sample(self.batch_size)
+        batch = list(zip(*transitions))
+        states, actions, rewards, next_states, dones = [np.array(lst) for lst in batch]
+        
+        states = torch.FloatTensor(states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(next_states)
+        dones = torch.FloatTensor(dones)
+        
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
+        next_q = self.target_net(next_states).max(1)[0]
+        expected_q = rewards + self.gamma * next_q * (1 - dones)
+        
+        loss = nn.MSELoss()(current_q, expected_q.detach())
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
-    def learn(self, state, action, reward, next_state, done):
-        if not done:
-            future_reward = np.max(self.q_table[next_state])
-        else:
-            future_reward = 0
-        td_target = reward + self.gamma * future_reward
-        td_error = td_target - self.q_table[state][action]
-        self.q_table[state][action] += self.alpha * td_error
-
-    def save(self, path):
-        np.save(path, self.q_table)
-
-    def load(self, path):
-        self.q_table = np.load(path, allow_pickle=True).item()
-
-def train(agent, env, episodes=1000):
+def train(env, agent, episodes=1000):
     for episode in range(episodes):
-        obs, _ = env.reset()
-        done = False
+        state, _ = env.reset()
         total_reward = 0
+        done = False
         while not done:
-            action = agent.act(str(obs))
-            next_obs, reward, done, _, _ = env.step(action)
-            agent.learn(str(obs), action, reward, str(next_obs), done)
-            obs = next_obs
+            action = agent.act(state, use_random=True)
+            next_state, reward, done, _, _ = env.step(action)
+            agent.memory.push(state, action, reward, next_state, done)
+            state = next_state
             total_reward += reward
-        if episode % 100 == 0:
-            print(f"Episode {episode}, Total Reward: {total_reward}")
-    return agent
-
+            agent.replay()
+        if episode % 10 == 0:
+            agent.target_net.load_state_dict(agent.policy_net.state_dict())
+        print(f"Episode: {episode}, Total reward: {total_reward}, Epsilon: {agent.epsilon}")
+        
 if __name__ == "__main__":
-    # Initialize the agent
-    agent = ProjectAgent()
-
-    # Train the agent
-    trained_agent = train(agent, env)
-
-    # Save the trained agent
-    trained_agent.save("trained_agent.npy")
-    print("Agent trained and saved.")
+    env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
+    agent = DDQNAgent()
+    train(env, agent)
+    agent.save("ddqn_agent.pth")
