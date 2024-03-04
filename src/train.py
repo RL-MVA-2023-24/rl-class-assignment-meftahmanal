@@ -1,119 +1,125 @@
+from gymnasium.wrappers import TimeLimit
+from env_hiv import HIVPatient
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 from collections import deque
 import random
-from gymnasium.wrappers import TimeLimit
-from env_hiv import HIVPatient
 
-# Neural Network Model Definition
+# Define the environment
+env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
+
+# Define the DQN Model
 class DQN(nn.Module):
-    def __init__(self, input_size, output_size):
+    def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
         self.network = nn.Sequential(
-            nn.Linear(input_size, 128),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, output_size)
+            nn.Linear(64, output_dim)
         )
 
     def forward(self, x):
         return self.network(x)
 
-# Replay Buffer to store experience
+# Replay Buffer for storing experiences
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done):
-        state = np.expand_dims(state, 0)
-        next_state = np.expand_dims(next_state, 0)
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
         state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.concatenate(state), action, reward, np.concatenate(next_state), done
+        return np.array(state), action, reward, np.array(next_state), done
 
     def __len__(self):
         return len(self.buffer)
 
-# Agent Implementation
+# Implementing the ProjectAgent
 class ProjectAgent:
     def __init__(self, state_size, action_size):
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = ReplayBuffer(10000)
         self.model = DQN(state_size, action_size)
+        self.target_model = DQN(state_size, action_size)
+        self.buffer = ReplayBuffer()
         self.optimizer = optim.Adam(self.model.parameters())
-        self.criterion = nn.MSELoss()
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.batch_size = 64
 
-    def act(self, state, epsilon):
-        if random.random() > epsilon:
-            state = torch.FloatTensor(state).unsqueeze(0)
-            q_values = self.model(state)
-            action = q_values.max(1)[1].item()
-        else:
-            action = random.randrange(self.action_size)
-        return action
+    def act(self, state, use_random=False):
+        if use_random or random.random() < self.epsilon:
+            return env.action_space.sample()
+        state = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            action_values = self.model(state)
+        return np.argmax(action_values.cpu().data.numpy())
 
-    def optimize(self, batch_size):
-        if len(self.memory) < batch_size:
+    def optimize_model(self):
+        if len(self.buffer) < self.batch_size:
             return
-        state, action, reward, next_state, done = self.memory.sample(batch_size)
-        state = torch.FloatTensor(state)
-        next_state = torch.FloatTensor(next_state)
-        action = torch.LongTensor(action)
-        reward = torch.FloatTensor(reward)
-        done = torch.FloatTensor(done)
+        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
 
-        q_values = self.model(state)
-        next_q_values = self.model(next_state)
-        q_value = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
-        next_q_value = next_q_values.max(1)[0]
-        expected_q_value = reward + 0.99 * next_q_value * (1 - done)
-        
-        loss = self.criterion(q_value, expected_q_value.detach())
+        states = torch.FloatTensor(states)
+        next_states = torch.FloatTensor(next_states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        dones = torch.FloatTensor(dones)
+
+        q_values = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_model(next_states).max(1)[0]
+        expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+
+        loss = nn.MSELoss()(q_values, expected_q_values.detach())
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        # Update epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def save(self, path="agent.pth"):
         torch.save(self.model.state_dict(), path)
 
     def load(self, path="agent.pth"):
         self.model.load_state_dict(torch.load(path))
+        self.model.eval()
 
-# Main Training Loop
-def train():
-    env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
+# Training Loop
+def train(num_episodes=1000):
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
     agent = ProjectAgent(state_size, action_size)
-    episodes = 1000  
-    epsilon_start = 1.0
-    epsilon_final = 0.01
-    epsilon_decay = 300
-    epsilon_by_episode = lambda episode: epsilon_final + (epsilon_start - epsilon_final) * np.exp(-1. * episode / epsilon_decay)
 
-    for episode in range(episodes):
-        state = env.reset()[0]
+    for episode in range(num_episodes):
+        state = env.reset()
         total_reward = 0
         done = False
         while not done:
-            epsilon = epsilon_by_episode(episode)
-            action = agent.act(state, epsilon)
-            next_state, reward, done, _, _ = env.step(action)
-            agent.memory.push(state, action, reward, next_state, done)
+            action = agent.act(state)
+            next_state, reward, done, _ = env.step(action)
+            agent.buffer.push(state, action, reward, next_state, done)
             state = next_state
             total_reward += reward
-            agent.optimize(64)
-
+            agent.optimize_model()
         if episode % 10 == 0:
-            print(f"Episode: {episode}, Total reward: {total_reward}, Epsilon: {epsilon}")
-            agent.save()
+            print(f"Episode: {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon}")
+    agent.save()
 
 if __name__ == "__main__":
     train()
+    agent = ProjectAgent(state_size=6, action_size=4)
+    agent.load()
+    score = evaluate_HIV(agent=agent, nb_episode=1)
+    print(score)
+    score_dr = evaluate_HIV_population(agent=agent, nb_episode=15)
+
+    
