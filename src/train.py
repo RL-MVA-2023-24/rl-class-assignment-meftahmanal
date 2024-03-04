@@ -1,28 +1,30 @@
-from gymnasium.wrappers import TimeLimit
-from env_hiv import HIVPatient
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import numpy as np
 import random
+from gymnasium.wrappers import TimeLimit
+from env_hiv import HIVPatient
 
+# Define the environment
 env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
 
+# Define the DQN network
 class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_size, output_size):
         super(DQN, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_dim)
-        )
+        self.layer1 = nn.Linear(input_size, 64)
+        self.layer2 = nn.Linear(64, 64)
+        self.layer3 = nn.Linear(64, output_size)
 
     def forward(self, x):
-        return self.network(x)
+        x = torch.relu(self.layer1(x))
+        x = torch.relu(self.layer2(x))
+        x = self.layer3(x)
+        return x
 
+# Replay memory for experience replay
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
@@ -31,39 +33,64 @@ class ReplayBuffer:
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = zip(*batch)
         return np.array(state), action, reward, np.array(next_state), done
 
-    def __len__(self):
-        return len(self.buffer)
-
+# Agent class implementing the required methods
 class ProjectAgent:
     def __init__(self):
         self.state_size = env.observation_space.shape[0]
         self.action_size = env.action_space.n
         self.memory = ReplayBuffer(10000)
         self.model = DQN(self.state_size, self.action_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.criterion = nn.MSELoss()
-        self.epsilon = 0.1
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.gamma = 0.99
 
     def act(self, state, use_random=False):
-        if random.random() < self.epsilon:
-            return env.action_space.sample()
+        if random.random() <= self.epsilon or use_random:
+            return random.randrange(self.action_size)
         else:
             state = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
                 action_values = self.model(state)
-            return action_values.max(1)[1].item()
+            return np.argmax(action_values.cpu().data.numpy())
 
-    def save(self, path):
+    def learn(self, batch_size):
+        if len(self.memory) < batch_size:
+            return
+        states, actions, rewards, next_states, dones = self.memory.sample(batch_size)
+        states = torch.FloatTensor(states)
+        next_states = torch.FloatTensor(next_states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        dones = torch.FloatTensor(dones)
+
+        Q_expected = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        Q_next = self.model(next_states).detach().max(1)[0]
+        Q_target = rewards + (self.gamma * Q_next * (1 - dones))
+        
+        loss = self.criterion(Q_expected, Q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def save(self, path='model.pth'):
         torch.save(self.model.state_dict(), path)
 
-    def load(self, path="model.pth"):
+    def load(self, path='model.pth'):
         self.model.load_state_dict(torch.load(path))
         self.model.eval()
 
-def train(agent, episodes=1000):
+# Training loop
+def train(agent, episodes=1000, batch_size=64):
     for episode in range(episodes):
         state = env.reset()
         total_reward = 0
@@ -72,11 +99,13 @@ def train(agent, episodes=1000):
             action = agent.act(state)
             next_state, reward, done, _ = env.step(action)
             agent.memory.push(state, action, reward, next_state, done)
+            agent.learn(batch_size)
             state = next_state
             total_reward += reward
-        print(f"Episode: {episode}, Total Reward: {total_reward}")
+        if episode % 10 == 0:
+            print(f"Episode: {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon}")
 
 if __name__ == "__main__":
     agent = ProjectAgent()
-    train(agent, 1000)
-    agent.save("model.pth")
+    train(agent)
+    agent.save('model.pth')
