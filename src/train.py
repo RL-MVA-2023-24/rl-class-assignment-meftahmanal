@@ -92,7 +92,7 @@ def train():
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
     agent = ProjectAgent(state_size, action_size)
-    episodes = 1000  # You can adjust this
+    episodes = 1000  
     epsilon_start = 1.0
     epsilon_final = 0.01
     epsilon_decay = 300
