@@ -33,6 +33,8 @@ class ReplayBuffer:
             torch.stack(next_states).to(self.device),
             torch.tensor(dones, device=self.device, dtype=torch.float)
         )
+    def __len__(self):
+        return len(self.data)
 
 class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
