@@ -10,6 +10,7 @@ from evaluate import evaluate_HIV, evaluate_HIV_population
 env = TimeLimit(
     env=HIVPatient(domain_randomization=False), max_episode_steps=200
 )
+
 # Define the neural network architecture
 def create_dqn(state_dim, num_actions, nb_neurons=256):
     return nn.Sequential(
@@ -71,16 +72,16 @@ class ProjectAgent:
         self.update_target_tau = config['update_target_tau']
         self.monitoring_num_trials = config['monitoring_num_trials']
 
-    def act(self, observation, use_random=False):
-        return self.greedy_action(self.model, observation)
+    def predict_action(self, observation, use_random=False):
+        return self.select_greedy_action(self.model, observation)
 
-    def save(self, path):
+    def store(self, path):
         torch.save(self.model.state_dict(), path)
 
-    def load(self, path):
+    def retrieve(self, path):
         self.model.load_state_dict(torch.load(path))
 
-    def monte_carlo_evaluation(self, env, num_trials):
+    def evaluate_monte_carlo(self, env, num_trials):
         total_rewards = []
         discounted_rewards = []
         for _ in range(num_trials):
@@ -91,7 +92,7 @@ class ProjectAgent:
             discounted_reward = 0
             step = 0
             while not (done or truncated):
-                action = self.greedy_action(self.model, state)
+                action = self.select_greedy_action(self.model, state)
                 next_state, reward, done, truncated, _ = env.step(action)
                 state = next_state
                 total_reward += reward
@@ -109,7 +110,7 @@ class ProjectAgent:
                 values.append(self.model(torch.Tensor(state).unsqueeze(0).to(self.device)).max().item())
         return np.mean(values)
 
-    def gradient_step(self):
+    def update_gradient(self):
         if len(self.memory) > self.batch_size:
             states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
             q_next_max = self.target_model(next_states).max(1)[0].detach()
@@ -120,12 +121,12 @@ class ProjectAgent:
             loss.backward()
             self.optimizer.step()
 
-    def greedy_action(self, network, state):
+    def select_greedy_action(self, network, state):
         with torch.no_grad():
             Q = network(torch.Tensor(state).unsqueeze(0).to(self.device))
             return torch.argmax(Q).item()
 
-    def train(self, env, max_episodes):
+    def train_agent(self, env, max_episodes):
         episode_returns = []
         mc_avg_total_rewards = []
         mc_avg_discounted_rewards = []
@@ -141,12 +142,12 @@ class ProjectAgent:
             if np.random.rand() < epsilon:
                 action = env.action_space.sample()
             else:
-                action = self.greedy_action(self.model, state)
+                action = self.select_greedy_action(self.model, state)
             next_state, reward, done, truncated, _ = env.step(action)
             self.memory.append(state, action, reward, next_state, done)
             episode_cum_reward += reward
             for _ in range(self.num_gradient_steps):
-                self.gradient_step()
+                self.update_gradient()
             if self.update_target_strategy == 'replace':
                 if step % self.update_target_freq == 0:
                     self.target_model.load_state_dict(self.model.state_dict())
@@ -161,33 +162,23 @@ class ProjectAgent:
             if done or truncated:
                 episode += 1
                 if self.monitoring_num_trials > 0:
-                    mc_discounted_reward, mc_total_reward = self.monte_carlo_evaluation(env, self.monitoring_num_trials)
+                    mc_discounted_reward, mc_total_reward = self.evaluate_monte_carlo(env, self.monitoring_num_trials)
                     initial_state_value = self.initial_state_value(env, self.monitoring_num_trials)
                     mc_avg_total_rewards.append(mc_total_reward)
                     mc_avg_discounted_rewards.append(mc_discounted_reward)
                     initial_state_values.append(initial_state_value)
                     episode_returns.append(episode_cum_reward)
-                    print("Episode ", '{:2d}'.format(episode),
-                          ", epsilon ", '{:6.2f}'.format(epsilon),
-                          ", batch size ", '{:4d}'.format(len(self.memory)),
-                          ", ep return ", '{:4.1f}'.format(episode_cum_reward),
-                          ", MC tot ", '{:6.2f}'.format(mc_total_reward),
-                          ", MC disc ", '{:6.2f}'.format(mc_discounted_reward),
-                          ", V0 ", '{:6.2f}'.format(initial_state_value),
-                          sep='')
+                    print(f"Episode {episode:2d}, epsilon {epsilon:.2f}, batch size {len(self.memory):4d}, ep return {episode_cum_reward:.2f}, MC tot {mc_total_reward:.2f}, MC disc {mc_discounted_reward:.2f}, V0 {initial_state_value:.2f}")
                 else:
                     episode_returns.append(episode_cum_reward)
-                    print("Episode ", '{:2d}'.format(episode),
-                          ", epsilon ", '{:6.2f}'.format(epsilon),
-                          ", batch size ", '{:4d}'.format(len(self.memory)),
-                          ", ep return ", '{:e}'.format(episode_cum_reward),
-                          sep='')
+                    print(f"Episode {episode:2d}, epsilon {epsilon:.2f}, batch size {len(self.memory):4d}, ep return {episode_cum_reward:.2f}")
                 state, _ = env.reset()
                 episode_cum_reward = 0
             else:
                 state = next_state
         return episode_returns, mc_avg_discounted_rewards, mc_avg_total_rewards, initial_state_values
 
+# Configuration parameters
 config = {
     'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     'num_actions': env.action_space.n,
@@ -200,7 +191,7 @@ config = {
     'epsilon_delay_decay': 20,
     'batch_size': 512,
     'gradient_steps': 3,
-    'update_target_strategy': 'replace', 
+    'update_target_strategy': 'replace',  # or 'ema'
     'update_target_freq': 50,
     'update_target_tau': 0.005,
     'criterion': nn.SmoothL1Loss(),
@@ -214,10 +205,10 @@ agent_model = create_dqn(state_dim, config['num_actions'])
 agent = ProjectAgent(config, agent_model)
 
 # Train the agent
-ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 200)
+ep_length, disc_rewards, tot_rewards, V0 = agent.train_agent(env, 200)
 
 # Save the trained model
-agent.save("model.pt")
+agent.store("model.pt")
 
 # Evaluate the agent
 score_agent = evaluate_HIV(agent=agent, nb_episode=1)
