@@ -2,69 +2,76 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from env_hiv import HIVPatient
-from typing import Protocol
-
-class Agent(Protocol):
-    def act(self, observation: np.ndarray, use_random: bool = False) -> int:
-        pass
-
-    def save(self, path: str) -> None:
-        pass
-
-    def load(self, path: str) -> None:
-        pass
+import gymnasium as gym
+from collections import namedtuple, deque
+import random
+from env_hiv import HIVPatient  
 
 class SimpleNN(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_size, output_size):
         super(SimpleNN, self).__init__()
         self.network = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_size, 128),
             nn.ReLU(),
-            nn.Linear(64, output_dim)
+            nn.Linear(128, output_size),
+            nn.Softmax(dim=1)
         )
-    
+        
     def forward(self, x):
         return self.network(x)
 
 class ProjectAgent:
     def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
         self.model = SimpleNN(state_size, action_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.criterion = nn.CrossEntropyLoss()
+        
     def act(self, observation, use_random=False):
-        if use_random:
-            return np.random.randint(0, 4)
+        if use_random or random.random() < 0.1:  
+            return random.choice(range(self.action_size))
+        self.model.eval()
         with torch.no_grad():
-            observation = torch.tensor(observation).float()
-            q_values = self.model(observation)
-            action = torch.argmax(q_values).item()
+            observation = torch.tensor(observation, dtype=torch.float).unsqueeze(0)
+            action_probs = self.model(observation)
+            action = torch.argmax(action_probs).item()
         return action
-
-    def save(self, path):
+    
+    def save(self, path='agent.pth'):
         torch.save(self.model.state_dict(), path)
+        
+    def load(self, path='agent.pth'):
+        self.model.load_state_dict(torch.load(path))
+        self.model.eval()
 
-    def load(self, path):
-        try:
-            self.model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
-        except FileNotFoundError:
-            print(f"No saved model at {path}. Starting from scratch.")
-
-def train():
-    env = HIVPatient(clipping=True, logscale=False, domain_randomization=True)
+def train_agent(episodes=1000, save_path='agent.pth'):
+    env = HIVPatient()
     agent = ProjectAgent(env.observation_space.shape[0], env.action_space.n)
-    episodes = 1000
+    
     for episode in range(episodes):
         state = env.reset()
+        total_reward = 0
         done = False
         while not done:
             action = agent.act(state)
             next_state, reward, done, _ = env.step(action)
-            # Update agent here based on (state, action, reward, next_state)
+            total_reward += reward
+            
+            agent.optimizer.zero_grad()
+            target = torch.tensor([action], dtype=torch.long)
+            prediction = agent.model(torch.tensor(state, dtype=torch.float).unsqueeze(0))
+            loss = agent.criterion(prediction, target)
+            loss.backward()
+            agent.optimizer.step()
+            
             state = next_state
+        
         if episode % 100 == 0:
-            print(f"Episode {episode}: completed")
-            agent.save("latest_model.pth")
+            print(f'Episode {episode}, Total Reward: {total_reward}')
+            agent.save(save_path)
+    
+    agent.save(save_path)
 
-if __name__ == "__main__":
-    train()
+if __name__ == '__main__':
+    train_agent()
