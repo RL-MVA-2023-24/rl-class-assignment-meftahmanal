@@ -1,109 +1,224 @@
-from gymnasium.wrappers import TimeLimit
-from env_hiv import HIVPatient
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import random
-from collections import deque
+from copy import deepcopy
+from gymnasium.wrappers import TimeLimit
+from env_hiv import HIVPatient
+from evaluate import evaluate_HIV, evaluate_HIV_population
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+env = TimeLimit(
+    env=HIVPatient(domain_randomization=False), max_episode_steps=200
+)
+# Define the neural network architecture
+def create_dqn(state_dim, num_actions, nb_neurons=256):
+    return nn.Sequential(
+        nn.Linear(state_dim, nb_neurons),
+        nn.ReLU(),
+        nn.Linear(nb_neurons, nb_neurons),
+        nn.ReLU(),
+        nn.Linear(nb_neurons, nb_neurons),
+        nn.ReLU(),
+        nn.Linear(nb_neurons, nb_neurons),
+        nn.ReLU(),
+        nn.Linear(nb_neurons, nb_neurons),
+        nn.ReLU(),
+        nn.Linear(nb_neurons, num_actions)
+    )
 
-class DQN(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_size, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, output_size)
-
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
-
+# Define the replay buffer class
 class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
+    def __init__(self, capacity, device):
+        self.capacity = capacity
+        self.buffer = []
+        self.index = 0
+        self.device = device
+    
+    def append(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.index] = (state, action, reward, next_state, done)
+        self.index = (self.index + 1) % self.capacity
+    
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = map(np.stack, zip(*batch))
-        return states, actions, rewards, next_states, dones
+        return list(map(lambda x: torch.Tensor(np.array(x)).to(self.device), zip(*batch)))
+    
+    def __len__(self):
+        return len(self.buffer)
 
+# Define the DQN agent class
 class ProjectAgent:
-    def __init__(self, env):
-        self.env = env
-        self.state_dim = env.observation_space.shape[0]
-        self.action_dim = env.action_space.n
-        self.model = DQN(self.state_dim, self.action_dim).to(device)
-        self.target_model = DQN(self.state_dim, self.action_dim).to(device)
-        self.target_model.load_state_dict(self.model.state_dict())
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        self.replay_buffer = ReplayBuffer(100000)
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.995
-        self.epsilon_min = 0.01
-        self.batch_size = 64
+    def __init__(self, config, model):
+        self.config = config
+        self.device = config['device']
+        self.num_actions = config['num_actions']
+        self.model = model
+        self.target_model = deepcopy(self.model).to(self.device)
+        self.memory = ReplayBuffer(config['buffer_size'], self.device)
+        self.optimizer = config['optimizer'](self.model.parameters(), lr=config['learning_rate'])
+        self.criterion = config['criterion']
+        self.epsilon_max = config['epsilon_max']
+        self.epsilon_min = config['epsilon_min']
+        self.epsilon_stop = config['epsilon_decay_period']
+        self.epsilon_delay = config['epsilon_delay_decay']
+        self.epsilon_step = (self.epsilon_max - self.epsilon_min) / self.epsilon_stop
+        self.batch_size = config['batch_size']
+        self.gamma = config['gamma']
+        self.num_gradient_steps = config['gradient_steps']
+        self.update_target_strategy = config['update_target_strategy']
+        self.update_target_freq = config['update_target_freq']
+        self.update_target_tau = config['update_target_tau']
+        self.monitoring_num_trials = config['monitoring_num_trials']
 
-    def act(self, state, use_random=False):
-        if random.random() < self.epsilon or use_random:
-            return self.env.action_space.sample()
-        else:
-            state = torch.FloatTensor(state).unsqueeze(0).to(device)
-            q_values = self.model(state)
-            return q_values.max(1)[1].item()
+    def act(self, observation, use_random=False):
+        return self.greedy_action(self.model, observation)
 
-    def train(self, episodes=200):
-        for episode in range(episodes):
-            state = self.env.reset()[0]
-            done = False
-            total_reward = 0
-            while not done:
-                action = self.act(state)
-                next_state, reward, done, _ = self.env.step(action)
-                self.replay_buffer.push(state, action, reward, next_state, done)
-                state = next_state
-                total_reward += reward
-                self.optimize_model()
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
-            print(f"Episode {episode}, Total reward: {total_reward}, Epsilon: {self.epsilon}")
-        self.update_target_network()
-
-    def optimize_model(self):
-        if len(self.replay_buffer) < self.batch_size:
-            return
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        states = torch.FloatTensor(states).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
-        actions = torch.LongTensor(actions).unsqueeze(-1).to(device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(-1).to(device)
-        dones = torch.FloatTensor(np.float32(dones)).unsqueeze(-1).to(device)
-
-        current_q_values = self.model(states).gather(1, actions)
-        max_next_q_values = self.target_model(next_states).max(1)[0].detach().unsqueeze(-1)
-        expected_q_values = rewards + (self.gamma * max_next_q_values * (1 - dones))
-
-        loss = nn.MSELoss()(current_q_values, expected_q_values)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-    def update_target_network(self):
-        self.target_model.load_state_dict(self.model.state_dict())
-
-    def save(self, path="dqn_model.pth"):
+    def save(self, path):
         torch.save(self.model.state_dict(), path)
 
-    def load(self, path="dqn_model.pth"):
-        self.model.load_state_dict(torch.load(path, map_location=device))
-        self.update_target_network()
+    def load(self, path):
+        self.model.load_state_dict(torch.load(path))
 
-env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
-agent = ProjectAgent(env)
-agent.train(episodes=200)
-agent.save("dqn_hiv_patient.pth")
+    def monte_carlo_evaluation(self, env, num_trials):
+        total_rewards = []
+        discounted_rewards = []
+        for _ in range(num_trials):
+            state, _ = env.reset()
+            done = False
+            truncated = False
+            total_reward = 0
+            discounted_reward = 0
+            step = 0
+            while not (done or truncated):
+                action = self.greedy_action(self.model, state)
+                next_state, reward, done, truncated, _ = env.step(action)
+                state = next_state
+                total_reward += reward
+                discounted_reward += self.gamma ** step * reward
+                step += 1
+            total_rewards.append(total_reward)
+            discounted_rewards.append(discounted_reward)
+        return np.mean(discounted_rewards), np.mean(total_rewards)
+
+    def initial_state_value(self, env, num_trials):
+        with torch.no_grad():
+            values = []
+            for _ in range(num_trials):
+                state, _ = env.reset()
+                values.append(self.model(torch.Tensor(state).unsqueeze(0).to(self.device)).max().item())
+        return np.mean(values)
+
+    def gradient_step(self):
+        if len(self.memory) > self.batch_size:
+            states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+            q_next_max = self.target_model(next_states).max(1)[0].detach()
+            update = torch.addcmul(rewards, 1 - dones, q_next_max, value=self.gamma)
+            q_pred = self.model(states).gather(1, actions.to(torch.long).unsqueeze(1))
+            loss = self.criterion(q_pred, update.unsqueeze(1))
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+    def greedy_action(self, network, state):
+        with torch.no_grad():
+            Q = network(torch.Tensor(state).unsqueeze(0).to(self.device))
+            return torch.argmax(Q).item()
+
+    def train(self, env, max_episodes):
+        episode_returns = []
+        mc_avg_total_rewards = []
+        mc_avg_discounted_rewards = []
+        initial_state_values = []
+        episode = 0
+        episode_cum_reward = 0
+        state, _ = env.reset()
+        epsilon = self.epsilon_max
+        step = 0
+        while episode < max_episodes:
+            if step > self.epsilon_delay:
+                epsilon = max(self.epsilon_min, epsilon - self.epsilon_step)
+            if np.random.rand() < epsilon:
+                action = env.action_space.sample()
+            else:
+                action = self.greedy_action(self.model, state)
+            next_state, reward, done, truncated, _ = env.step(action)
+            self.memory.append(state, action, reward, next_state, done)
+            episode_cum_reward += reward
+            for _ in range(self.num_gradient_steps):
+                self.gradient_step()
+            if self.update_target_strategy == 'replace':
+                if step % self.update_target_freq == 0:
+                    self.target_model.load_state_dict(self.model.state_dict())
+            if self.update_target_strategy == 'ema':
+                target_state_dict = self.target_model.state_dict()
+                model_state_dict = self.model.state_dict()
+                tau = self.update_target_tau
+                for key in model_state_dict:
+                    target_state_dict[key] = tau * model_state_dict[key] + (1 - tau) * target_state_dict[key]
+                self.target_model.load_state_dict(target_state_dict)
+            step += 1
+            if done or truncated:
+                episode += 1
+                if self.monitoring_num_trials > 0:
+                    mc_discounted_reward, mc_total_reward = self.monte_carlo_evaluation(env, self.monitoring_num_trials)
+                    initial_state_value = self.initial_state_value(env, self.monitoring_num_trials)
+                    mc_avg_total_rewards.append(mc_total_reward)
+                    mc_avg_discounted_rewards.append(mc_discounted_reward)
+                    initial_state_values.append(initial_state_value)
+                    episode_returns.append(episode_cum_reward)
+                    print("Episode ", '{:2d}'.format(episode),
+                          ", epsilon ", '{:6.2f}'.format(epsilon),
+                          ", batch size ", '{:4d}'.format(len(self.memory)),
+                          ", ep return ", '{:4.1f}'.format(episode_cum_reward),
+                          ", MC tot ", '{:6.2f}'.format(mc_total_reward),
+                          ", MC disc ", '{:6.2f}'.format(mc_discounted_reward),
+                          ", V0 ", '{:6.2f}'.format(initial_state_value),
+                          sep='')
+                else:
+                    episode_returns.append(episode_cum_reward)
+                    print("Episode ", '{:2d}'.format(episode),
+                          ", epsilon ", '{:6.2f}'.format(epsilon),
+                          ", batch size ", '{:4d}'.format(len(self.memory)),
+                          ", ep return ", '{:e}'.format(episode_cum_reward),
+                          sep='')
+                state, _ = env.reset()
+                episode_cum_reward = 0
+            else:
+                state = next_state
+        return episode_returns, mc_avg_discounted_rewards, mc_avg_total_rewards, initial_state_values
+
+config = {
+    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    'num_actions': env.action_space.n,
+    'learning_rate': 1e-3,
+    'gamma': 0.95,
+    'buffer_size': 1000000,
+    'epsilon_min': 0.01,
+    'epsilon_max': 1.,
+    'epsilon_decay_period': 1000,
+    'epsilon_delay_decay': 20,
+    'batch_size': 512,
+    'gradient_steps': 3,
+    'update_target_strategy': 'replace', 
+    'update_target_freq': 50,
+    'update_target_tau': 0.005,
+    'criterion': nn.SmoothL1Loss(),
+    'monitoring_num_trials': 0,
+    'optimizer': torch.optim.Adam,
+}
+
+# Initialize the agent
+state_dim = env.observation_space.shape[0]
+agent_model = create_dqn(state_dim, config['num_actions'])
+agent = ProjectAgent(config, agent_model)
+
+# Train the agent
+ep_length, disc_rewards, tot_rewards, V0 = agent.train(env, 200)
+
+# Save the trained model
+agent.save("model.pt")
+
+# Evaluate the agent
+score_agent = evaluate_HIV(agent=agent, nb_episode=1)
+score_agent_dr = evaluate_HIV_population(agent=agent, nb_episode=15)
