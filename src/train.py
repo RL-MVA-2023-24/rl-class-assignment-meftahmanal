@@ -33,6 +33,7 @@ class ReplayBuffer:
         
         return states, actions, rewards, next_states, dones
 
+
     def __len__(self):
         return len(self.data)
 
@@ -117,5 +118,4 @@ action_size = env.action_space.n
 agent = ProjectAgent(state_size, action_size, device='cuda' if torch.cuda.is_available() else 'cpu')
 scores = train_agent()
 
-# Save the trained model
 torch.save(agent.model.state_dict(), 'model.pth')
