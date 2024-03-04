@@ -1,77 +1,95 @@
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import gymnasium as gym
-from collections import namedtuple, deque
 import random
-from env_hiv import HIVPatient  
+from collections import deque
+from src.env_hiv import HIVPatient  # Assuming env_hiv.py contains the environment
 
-class SimpleNN(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(SimpleNN, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_size),
-            nn.Softmax(dim=1)
-        )
-        
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_size, 64)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, action_size)
+
     def forward(self, x):
-        return self.network(x)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        return self.fc3(x)
 
 class ProjectAgent:
     def __init__(self, state_size, action_size):
         self.state_size = state_size
         self.action_size = action_size
-        self.model = SimpleNN(state_size, action_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        self.criterion = nn.CrossEntropyLoss()
-        
-    def act(self, observation, use_random=False):
-        if use_random or random.random() < 0.1:  
-            return random.choice(range(self.action_size))
-        self.model.eval()
-        with torch.no_grad():
-            observation = torch.tensor(observation, dtype=torch.float).unsqueeze(0)
-            action_probs = self.model(observation)
-            action = torch.argmax(action_probs).item()
-        return action
-    
-    def save(self, path='agent.pth'):
-        torch.save(self.model.state_dict(), path)
-        
-    def load(self, path='agent.pth'):
-        self.model.load_state_dict(torch.load(path))
-        self.model.eval()
+        self.memory = deque(maxlen=10000)
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.model = DQN(state_size, action_size).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
-def train_agent(episodes=1000, save_path='agent.pth'):
-    env = HIVPatient()
-    agent = ProjectAgent(env.observation_space.shape[0], env.action_space.n)
-    
-    for episode in range(episodes):
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        state = torch.FloatTensor(state).to(device)
+        act_values = self.model(state)
+        return np.argmax(act_values.cpu().data.numpy())
+
+    def replay(self, batch_size):
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                next_state = torch.FloatTensor(next_state).to(device)
+                target = (reward + self.gamma *
+                          np.amax(self.model(next_state).cpu().data.numpy()))
+            state = torch.FloatTensor(state).to(device)
+            target_f = self.model(state)
+            target_f[0][action] = target
+            self.optimizer.zero_grad()
+            loss = nn.MSELoss()(target_f[0], torch.tensor(target).to(device))
+            loss.backward()
+            self.optimizer.step()
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def load(self, name):
+        self.model.load_state_dict(torch.load(name))
+
+    def save(self, name):
+        torch.save(self.model.state_dict(), name)
+
+def train(agent, env, episodes=1000, batch_size=32):
+    for e in range(episodes):
         state = env.reset()
-        total_reward = 0
-        done = False
-        while not done:
+        state = np.reshape(state, [1, agent.state_size])
+        for time in range(200):
             action = agent.act(state)
             next_state, reward, done, _ = env.step(action)
-            total_reward += reward
-            
-            agent.optimizer.zero_grad()
-            target = torch.tensor([action], dtype=torch.long)
-            prediction = agent.model(torch.tensor(state, dtype=torch.float).unsqueeze(0))
-            loss = agent.criterion(prediction, target)
-            loss.backward()
-            agent.optimizer.step()
-            
+            next_state = np.reshape(next_state, [1, agent.state_size])
+            agent.remember(state, action, reward, next_state, done)
             state = next_state
-        
-        if episode % 100 == 0:
-            print(f'Episode {episode}, Total Reward: {total_reward}')
-            agent.save(save_path)
-    
-    agent.save(save_path)
+            if done:
+                print("episode: {}/{}, score: {}, e: {:.2}".format(e, episodes, time, agent.epsilon))
+                break
+            if len(agent.memory) > batch_size:
+                agent.replay(batch_size)
+        if e % 10 == 0:
+            agent.save("./hiv_dqn_model.pth")
 
-if __name__ == '__main__':
-    train_agent()
+if __name__ == "__main__":
+    env = HIVPatient()
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
+    agent = ProjectAgent(state_size=state_size, action_size=action_size)
+    train(agent, env)
