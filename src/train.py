@@ -1,121 +1,66 @@
+import numpy as np
+from collections import defaultdict
+
+# Import the environment and necessary wrappers
 from gymnasium.wrappers import TimeLimit
 from env_hiv import HIVPatient
-from interface import Agent
-import torch
-import torch.nn as nn
-import numpy as np
-import random
-import os
 
-env = TimeLimit(env=HIVPatient(domain_randomization=False), max_episode_steps=200)
+# Set up the environment with domain randomization disabled
+env = TimeLimit(
+    env=HIVPatient(domain_randomization=False), max_episode_steps=200
+)
 
-class ReplayBuffer:
-    def __init__(self, capacity, device):
-        self.capacity = capacity
-        self.data = []
-        self.index = 0
-        self.device = device
+class ProjectAgent:
+    def __init__(self, n_actions=4, n_states=6, alpha=0.1, gamma=0.9, epsilon=0.1):
+        self.n_actions = n_actions
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.q_table = defaultdict(lambda: np.zeros(n_actions))
 
-    def append(self, s, a, r, s_, d):
-        if len(self.data) < self.capacity:
-            self.data.append(None)
-        self.data[self.index] = (s, a, r, s_, d)
-        self.index = (self.index + 1) % self.capacity
-
-    def sample(self, batch_size):
-        experiences = random.sample(self.data, batch_size)
-        
-        states = torch.tensor([e[0] for e in experiences], dtype=torch.float, device=self.device)
-        actions = torch.tensor([e[1] for e in experiences], dtype=torch.long, device=self.device)
-        rewards = torch.tensor([e[2] for e in experiences], dtype=torch.float, device=self.device)
-        next_states = torch.tensor([e[3] for e in experiences], dtype=torch.float, device=self.device)
-        dones = torch.tensor([e[4] for e in experiences], dtype=torch.float, device=self.device)
-        
-        return states, actions, rewards, next_states, dones
-
-
-    def __len__(self):
-        return len(self.data)
-
-class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_dim)
-
-    def forward(self, state):
-        x = torch.relu(self.fc1(state))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
-
-class ProjectAgent(Agent):
-    def __init__(self, state_size, action_size, device):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.device = device
-        self.model = QNetwork(state_size, action_size).to(device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
-        self.replay_buffer = ReplayBuffer(10000, device)
-        self.batch_size = 64
-        self.gamma = 0.99
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.995
-        self.epsilon_min = 0.01
-
-    def act(self, state):
-        state = torch.tensor([state], device=self.device, dtype=torch.float)
-        if random.random() > self.epsilon:
-            with torch.no_grad():
-                action_values = self.model(state)
-            return np.argmax(action_values.cpu().data.numpy())
+    def act(self, state, use_random=False):
+        if np.random.uniform(0, 1) < self.epsilon or use_random:
+            return np.random.randint(self.n_actions)
         else:
-            return random.choice(np.arange(self.action_size))
+            return np.argmax(self.q_table[state])
 
-    def step(self, state, action, reward, next_state, done):
-        self.replay_buffer.append(state, action, reward, next_state, done)
-        self.learn()
+    def learn(self, state, action, reward, next_state, done):
+        if not done:
+            future_reward = np.max(self.q_table[next_state])
+        else:
+            future_reward = 0
+        td_target = reward + self.gamma * future_reward
+        td_error = td_target - self.q_table[state][action]
+        self.q_table[state][action] += self.alpha * td_error
 
-    def learn(self):
-        if len(self.replay_buffer) < self.batch_size:
-            return
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+    def save(self, path):
+        np.save(path, self.q_table)
 
-        Q_targets_next = self.model(next_states).detach().max(1)[0].unsqueeze(1)
-        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
+    def load(self, path):
+        self.q_table = np.load(path, allow_pickle=True).item()
 
-        Q_expected = self.model(states).gather(1, actions.unsqueeze(1))
+def train(agent, env, episodes=1000):
+    for episode in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        total_reward = 0
+        while not done:
+            action = agent.act(str(obs))
+            next_obs, reward, done, _, _ = env.step(action)
+            agent.learn(str(obs), action, reward, str(next_obs), done)
+            obs = next_obs
+            total_reward += reward
+        if episode % 100 == 0:
+            print(f"Episode {episode}, Total Reward: {total_reward}")
+    return agent
 
-        loss = nn.MSELoss()(Q_expected, Q_targets)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+if __name__ == "__main__":
+    # Initialize the agent
+    agent = ProjectAgent()
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+    # Train the agent
+    trained_agent = train(agent, env)
 
-def train_agent(n_episodes=2000, max_t=1000):
-    scores = []
-    for i_episode in range(1, n_episodes+1):
-        state = env.reset()[0]
-        score = 0
-        for t in range(max_t):
-            action = agent.act(state)
-            next_state, reward, done, _, _ = env.step(action)
-            agent.step(state, action, reward, next_state, done)
-            state = next_state
-            score += reward
-            if done:
-                break
-        scores.append(score)
-        print(f'Episode {i_episode}\tScore: {score:.2f}')
-    return scores
-
-# Define state and action sizes
-state_size = env.observation_space.shape[0]
-action_size = env.action_space.n
-
-agent = ProjectAgent(state_size, action_size, device='cuda' if torch.cuda.is_available() else 'cpu')
-scores = train_agent()
-
-torch.save(agent.model.state_dict(), 'model.pth')
+    # Save the trained agent
+    trained_agent.save("trained_agent.npy")
+    print("Agent trained and saved.")
