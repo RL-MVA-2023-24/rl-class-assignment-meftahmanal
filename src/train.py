@@ -35,7 +35,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-class DDQNAgent(Agent):
+class ProjectAgent():
     def __init__(self):
         self.policy_net = DQN()
         self.target_net = DQN()
@@ -100,6 +100,6 @@ def train(env, agent, episodes=1000):
         
 if __name__ == "__main__":
     env = TimeLimit(HIVPatient(domain_randomization=False), max_episode_steps=200)
-    agent = DDQNAgent()
+    agent = ProjectAgent()
     train(env, agent)
     agent.save("ddqn_agent.pth")
